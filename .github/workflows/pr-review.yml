@@ -1,8 +1,9 @@
 name: pr-review
 
 on:
-    pull_request_target:
-        types: [opened, reopened, synchronize, ready_for_review]
+    workflow_run:
+        workflows: [PR - Docker build test]
+        types: [completed]
     workflow_dispatch:
         inputs:
             pr_number:
@@ -12,7 +13,7 @@ on:
 
 jobs:
     review-pr:
-        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+        if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         permissions:
@@ -21,29 +22,94 @@ jobs:
             pull-requests: write
         steps:
             - name: Checkout repository
-              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            # https://github.com/orgs/community/discussions/25220#discussioncomment-11316244
+            - name: Search the PR that triggered this workflow
+              if: github.event_name != 'workflow_dispatch'
+              id: source-run-info
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  PR_TARGET_REPO: ${{ github.repository }}
+                  # The REST API `head` filter requires `<owner>:<branch>` format
+                  PR_BRANCH: ${{ format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch) }}
+              run: |
+                  gh api "repos/${PR_TARGET_REPO}/pulls" \
+                    --method GET -f head="${PR_BRANCH}" -f state=open \
+                    --jq '.[0] | "number=\(.number)"' \
+                    >> "${GITHUB_OUTPUT}"
+
+            - name: Check PR author
+              if: github.event_name != 'workflow_dispatch'
+              id: check-pr-author
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  PR_TARGET_REPO: ${{ github.repository }}
+                  PR_NUMBER: ${{ steps.source-run-info.outputs.number }}
+              run: |
+                  AUTHOR=$(gh pr view --repo "${PR_TARGET_REPO}" "${PR_NUMBER}" --json author --jq '.author.login')
+                  echo "author=${AUTHOR}" >> "${GITHUB_OUTPUT}"
+                  if [[ "${AUTHOR}" == "dependabot[bot]" || "${AUTHOR}" == "app/dependabot" ]]; then
+                    echo "skip=true" >> "${GITHUB_OUTPUT}"
+                  else
+                    echo "skip=false" >> "${GITHUB_OUTPUT}"
+                  fi
+
+            - name: Comment on failed Docker build
+              if: github.event_name != 'workflow_dispatch' && github.event.workflow_run.conclusion == 'failure'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  PR_TARGET_REPO: ${{ github.repository }}
+                  PR_NUMBER: ${{ steps.source-run-info.outputs.number }}
+              run: |
+                  gh pr comment --repo "${PR_TARGET_REPO}" "${PR_NUMBER}" --body "<!-- pr-auto-review -->
+                  ## Auto Review
+                  ⚠️ PR review will proceed after the Docker image can be successfully built.
+
+                  Please fix the Docker build test issues first."
 
             - name: Set up Bun
-              uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
+              if: github.event_name == 'workflow_dispatch' || (steps.check-pr-author.outputs.skip != 'true' && github.event.workflow_run.conclusion != 'failure')
+              uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
             - name: Install opencode
+              if: github.event_name == 'workflow_dispatch' || (steps.check-pr-author.outputs.skip != 'true' && github.event.workflow_run.conclusion != 'failure')
               run: curl -fsSL https://opencode.ai/install | bash
 
             - name: Review PR with rules
+              if: github.event_name == 'workflow_dispatch' || (steps.check-pr-author.outputs.skip != 'true' && github.event.workflow_run.conclusion != 'failure')
               env:
                   OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   GITHUB_REPOSITORY: ${{ github.repository }}
-                  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+                  PR_NUMBER: ${{ steps.source-run-info.outputs.number || inputs.pr_number }}
                   OPENCODE_PERMISSION: |
                       {
                         "bash": {
                           "*": "deny",
+                          "base64*": "allow",
+                          "cat*": "allow",
+                          "echo*": "allow",
+                          "gh api*": "allow",
                           "gh auth*": "allow",
-                          "gh pr*": "allow",
-                          "gh api*": "allow"
+                          "gh pr comment*": "allow",
+                          "gh pr diff*": "allow",
+                          "gh pr view*": "allow",
+                          "gh repo view*": "allow",
+                          "gh search*": "allow",
+                          "git diff*": "allow",
+                          "git log*": "allow",
+                          "git show*": "allow",
+                          "git status*": "allow",
+                          "grep*": "allow",
+                          "head*": "allow",
+                          "ls*": "allow",
+                          "rg*": "allow",
+                          "sed*": "allow",
+                          "tail*": "allow",
+                          "wc*": "allow"
                         },
-                        "webfetch": "deny"
+                        "webfetch": "${{ github.event_name == 'workflow_dispatch' && 'allow' || 'deny' }}"
                       }
               run: |
                   if [ -z "$PR_NUMBER" ]; then
@@ -65,7 +131,6 @@ jobs:
                   1. Use GitHub CLI commands to inspect this PR's metadata and code changes.
                   2. Review only based on the following rules.
                   3. Report only clear and actionable violations from changed files.
-                  4. If no clear violations are found, do not comment.
 
                   Review rules:
                   $RULES
@@ -81,7 +146,21 @@ jobs:
                   - Check existing comments in issue comments for this marker.
                   - If a marker comment exists, update it with latest findings.
                   - Otherwise create a new PR comment.
-                  - If there are no findings and marker comment exists, edit marker comment to a short pass status.
+                  - If there are no findings: when a marker comment exists, edit it to the short pass status below; when none exists, do not comment.
+
+                  gh command reference (PR_NUMBER and GITHUB_REPOSITORY are available as env vars):
+                  - Create a new PR comment:
+                      gh pr comment \"\$PR_NUMBER\" --repo \"\$GITHUB_REPOSITORY\" --body \"<!-- pr-auto-review -->
+                      ## Auto Review
+                      ...\"
+                  - List existing marker comments to find the one to update:
+                      gh pr view \"\$PR_NUMBER\" --repo \"\$GITHUB_REPOSITORY\" --json comments \\
+                        --jq '.comments[] | select(.body | startswith(\"<!-- pr-auto-review -->\")) | {id: .id, body: .body}'
+                  - Update an existing marker comment (use the numeric id from the URL, not the node id):
+                      gh api \"repos/\$GITHUB_REPOSITORY/issues/comments/<comment_id>\" -X PATCH -f body=\"<!-- pr-auto-review -->
+                      ## Auto Review
+                      ...\"
+                  - Prefer --body-file - with a heredoc when the body contains quotes or many lines.
 
                   Suggested comment format:
                   <!-- pr-auto-review -->
